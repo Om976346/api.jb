@@ -187,4 +187,6 @@ app.get('/api/courses/search', authenticateToken, async (req, res) => {
   }
 });
 
-export default createServer(app);
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
