@@ -6,7 +6,6 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import dotenv from "dotenv";
 
-
 dotenv.config();
 
 const app = express();
@@ -29,6 +28,7 @@ const userSchema = new mongoose.Schema({
   name: { type: String, required: true },
   email: { type: String, required: true, unique: true },
   password: { type: String, required: true },
+  isAdmin: { type: Boolean, default: false }, // Add isAdmin field
 });
 
 const User = mongoose.model('User', userSchema);
@@ -55,6 +55,19 @@ const authenticateToken = (req, res, next) => {
     next();
   } catch (error) {
     res.status(400).json({ message: 'Invalid token' });
+  }
+};
+
+// Middleware to check if the user is an admin
+const isAdmin = async (req, res, next) => {
+  try {
+    const user = await User.findById(req.userId);
+    if (!user || !user.isAdmin) {
+      return res.status(403).json({ message: 'Access denied. Admin privileges required.' });
+    }
+    next();
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
 
@@ -108,7 +121,7 @@ app.post('/api/signin', async (req, res) => {
       expiresIn: '1h',
     });
 
-    res.status(200).json({ token, message: 'Sign-in successful' });
+    res.status(200).json({ token, isAdmin: user.isAdmin, message: 'Sign-in successful' });
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
   }
@@ -139,8 +152,8 @@ app.get('/api/courses', authenticateToken, async (req, res) => {
   }
 });
 
-// Add a new course
-app.post('/api/courses', authenticateToken, async (req, res) => {
+// Add a new course (Admin only)
+app.post('/api/courses', authenticateToken, isAdmin, async (req, res) => {
   const { title, lessons, image } = req.body;
 
   try {
@@ -157,8 +170,8 @@ app.post('/api/courses', authenticateToken, async (req, res) => {
   }
 });
 
-// Delete a course
-app.delete('/api/courses/:id', authenticateToken, async (req, res) => {
+// Delete a course (Admin only)
+app.delete('/api/courses/:id', authenticateToken, isAdmin, async (req, res) => {
   const { id } = req.params;
 
   try {
@@ -187,6 +200,7 @@ app.get('/api/courses/search', authenticateToken, async (req, res) => {
   }
 });
 
+// Start Server
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
