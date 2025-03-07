@@ -118,7 +118,7 @@ app.post('/api/signin', async (req, res) => {
 
     // Generate JWT token
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, {
-      expiresIn: '1h',
+      expiresIn: '48h',
     });
 
     res.status(200).json({ token, isAdmin: user.isAdmin, message: 'Sign-in successful' });
