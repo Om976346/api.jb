@@ -28,7 +28,7 @@ const userSchema = new mongoose.Schema({
   name: { type: String, required: true },
   email: { type: String, required: true, unique: true },
   password: { type: String, required: true },
-  isAdmin: { type: Boolean, default: false }, // Add isAdmin field
+  isAdmin: { type: Boolean, default: false },
 });
 
 const User = mongoose.model('User', userSchema);
@@ -37,10 +37,20 @@ const User = mongoose.model('User', userSchema);
 const courseSchema = new mongoose.Schema({
   title: { type: String, required: true },
   lessons: { type: String, required: true },
-  image: { type: String, required: true }, // Store CDN URL for the image
+  image: { type: String, required: true },
 });
 
 const Course = mongoose.model('Course', courseSchema);
+
+// Topic Schema
+const topicSchema = new mongoose.Schema({
+  title: { type: String, required: true },
+  duration: { type: String, required: true },
+  youtubeLink: { type: String, required: true },
+  courseId: { type: mongoose.Schema.Types.ObjectId, ref: 'Course', required: true },
+});
+
+const Topic = mongoose.model('Topic', topicSchema);
 
 // Middleware to verify JWT token
 const authenticateToken = (req, res, next) => {
@@ -51,7 +61,7 @@ const authenticateToken = (req, res, next) => {
 
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.userId = decoded.id; // Attach user ID to the request object
+    req.userId = decoded.id;
     next();
   } catch (error) {
     res.status(400).json({ message: 'Invalid token' });
@@ -74,22 +84,16 @@ const isAdmin = async (req, res, next) => {
 // API Routes
 
 // User Routes
-
-// Sign-Up Route
 app.post('/api/signup', async (req, res) => {
   const { name, email, password } = req.body;
 
   try {
-    // Check if user already exists
     const existingUser = await User.findOne({ email });
     if (existingUser) {
       return res.status(400).json({ message: 'User already exists' });
     }
 
-    // Hash the password
     const hashedPassword = await bcrypt.hash(password, 10);
-
-    // Create new user
     const newUser = new User({ name, email, password: hashedPassword });
     await newUser.save();
 
@@ -99,26 +103,22 @@ app.post('/api/signup', async (req, res) => {
   }
 });
 
-// Sign-In Route
 app.post('/api/signin', async (req, res) => {
   const { email, password } = req.body;
 
   try {
-    // Check if user exists
     const user = await User.findOne({ email });
     if (!user) {
       return res.status(400).json({ message: 'User not found' });
     }
 
-    // Validate password
     const isPasswordValid = await bcrypt.compare(password, user.password);
     if (!isPasswordValid) {
       return res.status(400).json({ message: 'Invalid password' });
     }
 
-    // Generate JWT token
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, {
-      expiresIn: '48h',
+      expiresIn: '1h',
     });
 
     res.status(200).json({ token, isAdmin: user.isAdmin, message: 'Sign-in successful' });
@@ -127,10 +127,9 @@ app.post('/api/signin', async (req, res) => {
   }
 });
 
-// Get User Details by ID
 app.get('/api/user', authenticateToken, async (req, res) => {
   try {
-    const user = await User.findById(req.userId, { password: 0 }); // Exclude password
+    const user = await User.findById(req.userId, { password: 0 });
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
@@ -141,8 +140,6 @@ app.get('/api/user', authenticateToken, async (req, res) => {
 });
 
 // Course Routes
-
-// Fetch all courses
 app.get('/api/courses', authenticateToken, async (req, res) => {
   try {
     const courses = await Course.find();
@@ -152,7 +149,6 @@ app.get('/api/courses', authenticateToken, async (req, res) => {
   }
 });
 
-// Add a new course (Admin only)
 app.post('/api/courses', authenticateToken, isAdmin, async (req, res) => {
   const { title, lessons, image } = req.body;
 
@@ -170,7 +166,6 @@ app.post('/api/courses', authenticateToken, isAdmin, async (req, res) => {
   }
 });
 
-// Delete a course (Admin only)
 app.delete('/api/courses/:id', authenticateToken, isAdmin, async (req, res) => {
   const { id } = req.params;
 
@@ -182,20 +177,59 @@ app.delete('/api/courses/:id', authenticateToken, isAdmin, async (req, res) => {
   }
 });
 
-// Search for courses by title
 app.get('/api/courses/search', authenticateToken, async (req, res) => {
-  const { query } = req.query; // Get the search query from the request
+  const { query } = req.query;
 
   try {
     if (!query) {
       return res.status(400).json({ message: 'Search query is required' });
     }
 
-    // Use a regex to perform a case-insensitive search
     const courses = await Course.find({ title: { $regex: query, $options: 'i' } });
     res.status(200).json(courses);
   } catch (error) {
     console.error('Error searching courses:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Topic Routes
+app.get('/api/courses/:courseId/topics', authenticateToken, async (req, res) => {
+  const { courseId } = req.params;
+
+  try {
+    const topics = await Topic.find({ courseId });
+    res.status(200).json(topics);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+app.post('/api/courses/:courseId/topics', authenticateToken, isAdmin, async (req, res) => {
+  const { courseId } = req.params;
+  const { title, duration, youtubeLink } = req.body;
+
+  try {
+    if (!title || !duration || !youtubeLink) {
+      return res.status(400).json({ message: 'All fields are required' });
+    }
+
+    const newTopic = new Topic({ title, duration, youtubeLink, courseId });
+    await newTopic.save();
+    res.status(201).json(newTopic);
+  } catch (error) {
+    console.error('Error adding topic:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+app.delete('/api/topics/:id', authenticateToken, isAdmin, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    await Topic.findByIdAndDelete(id);
+    res.status(200).json({ message: 'Topic deleted successfully' });
+  } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
   }
 });
