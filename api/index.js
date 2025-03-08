@@ -234,6 +234,33 @@ app.delete('/api/topics/:id', authenticateToken, isAdmin, async (req, res) => {
   }
 });
 
+app.put('/api/user', async (req, res) => {
+  try {
+    const { name, email } = req.body;
+    const token = req.headers.authorization.split(' ')[1]; // Extract token from header
+
+    // Verify the token and get the user ID
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const userId = decoded.userId;
+
+    // Update the user's name and email
+    const updatedUser = await User.findByIdAndUpdate(
+      userId,
+      { name, email },
+      { new: true }
+    );
+
+    if (!updatedUser) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    res.status(200).json({ message: 'Profile updated successfully' });
+  } catch (error) {
+    console.error('Error updating profile:', error);
+    res.status(500).json({ message: 'Failed to update profile' });
+  }
+});
+
 // Start Server
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
