@@ -234,14 +234,18 @@ app.delete('/api/topics/:id', authenticateToken, isAdmin, async (req, res) => {
   }
 });
 
-app.put('/api/user', async (req, res) => {
+app.put('/api/user', authenticateToken, async (req, res) => {
   try {
+    console.log('Request Body:', req.body); // Debugging
     const { name, email } = req.body;
-    const token = req.headers.authorization.split(' ')[1]; // Extract token from header
 
-    // Verify the token and get the user ID
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const userId = decoded.userId;
+    // Validate request body
+    if (!name || !email) {
+      return res.status(400).json({ message: 'Name and email are required' });
+    }
+
+    const userId = req.userId; // Get user ID from the token
+    console.log('User ID:', userId); // Debugging
 
     // Update the user's name and email
     const updatedUser = await User.findByIdAndUpdate(
@@ -254,9 +258,10 @@ app.put('/api/user', async (req, res) => {
       return res.status(404).json({ message: 'User not found' });
     }
 
+    console.log('Updated User:', updatedUser); // Debugging
     res.status(200).json({ message: 'Profile updated successfully' });
   } catch (error) {
-    console.error('Error updating profile:', error);
+    console.error('Error updating profile:', error); // Debugging
     res.status(500).json({ message: 'Failed to update profile' });
   }
 });
