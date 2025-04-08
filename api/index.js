@@ -1,11 +1,11 @@
 import express from "express";
 import mongoose from "mongoose";
 import cors from "cors";
-import bodyParser from "body-parser";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import dotenv from "dotenv";
 
+// Load environment variables
 dotenv.config();
 
 const app = express();
@@ -13,7 +13,8 @@ const PORT = process.env.PORT || 2004;
 
 // Middleware
 app.use(cors());
-app.use(bodyParser.json());
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
 // MongoDB Connection
 mongoose
@@ -22,9 +23,12 @@ mongoose
     useUnifiedTopology: true,
   })
   .then(() => console.log("MongoDB Connected"))
-  .catch((err) => console.log(err));
+  .catch((err) => {
+    console.error("Database Connection Error: ", err.message);
+    process.exit(1);
+  });
 
-// User Schema
+// Models
 const userSchema = new mongoose.Schema({
   name: { type: String, required: true },
   email: { type: String, required: true, unique: true },
@@ -34,7 +38,6 @@ const userSchema = new mongoose.Schema({
 
 const User = mongoose.model("User", userSchema);
 
-// Course Schema
 const courseSchema = new mongoose.Schema({
   title: { type: String, required: true },
   lessons: { type: String, required: true },
@@ -43,227 +46,198 @@ const courseSchema = new mongoose.Schema({
 
 const Course = mongoose.model("Course", courseSchema);
 
-// Topic Schema
 const topicSchema = new mongoose.Schema({
+  courseId: { type: mongoose.Schema.Types.ObjectId, ref: "Course", required: true },
   title: { type: String, required: true },
   duration: { type: String, required: true },
   youtubeLink: { type: String, required: true },
-  courseId: { type: mongoose.Schema.Types.ObjectId, ref: "Course", required: true },
 });
 
 const Topic = mongoose.model("Topic", topicSchema);
 
-// Middleware to verify JWT token
+// Utility Functions
+const asyncHandler = (fn) => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
+
 const authenticateToken = (req, res, next) => {
   const token = req.header("Authorization")?.split(" ")[1];
-  if (!token) {
-    return res.status(401).json({ message: "Access denied. No token provided." });
-  }
+  if (!token) return res.status(401).json({ message: "No token provided." });
 
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+    if (err) return res.status(403).json({ message: "Invalid token." });
     req.userId = decoded.id;
     next();
-  } catch (error) {
-    res.status(400).json({ message: "Invalid token" });
-  }
+  });
 };
 
-// Middleware to check if the user is an admin
 const isAdmin = async (req, res, next) => {
-  try {
-    const user = await User.findById(req.userId);
-    if (!user || !user.isAdmin) {
-      return res.status(403).json({ message: "Access denied. Admin privileges required." });
-    }
-    next();
-  } catch (error) {
-    res.status(500).json({ message: "Server error", error: error.message });
-  }
+  const user = await User.findById(req.userId).lean();
+  if (!user?.isAdmin) return res.status(403).json({ message: "Admin access required." });
+  next();
 };
 
-// API Routes
+// ---------- API Routes ----------
 
 // User Routes
-app.post("/api/signup", async (req, res) => {
-  const { name, email, password } = req.body;
+app.post(
+  "/api/signup",
+  asyncHandler(async (req, res) => {
+    const { name, email, password } = req.body;
 
-  try {
-    const existingUser = await User.findOne({ email });
-    if (existingUser) {
-      return res.status(400).json({ message: "User already exists" });
+    if (!name || !email || !password) {
+      return res.status(400).json({ message: "All fields are required." });
     }
 
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const newUser = new User({ name, email, password: hashedPassword });
-    await newUser.save();
+    const userExists = await User.exists({ email });
+    if (userExists) {
+      return res.status(400).json({ message: "User already exists." });
+    }
 
-    res.status(201).json({ message: "User created successfully" });
-  } catch (error) {
-    res.status(500).json({ message: "Server error", error: error.message });
-  }
-});
+    const hashedPassword = await bcrypt.hash(password, 12);
+    const newUser = await User.create({ name, email, password: hashedPassword });
 
-app.post("/api/signin", async (req, res) => {
-  const { email, password } = req.body;
+    res.status(201).json({ message: "User created successfully", userId: newUser._id });
+  })
+);
 
-  try {
+app.post(
+  "/api/signin",
+  asyncHandler(async (req, res) => {
+    const { email, password } = req.body;
+
     const user = await User.findOne({ email });
-    if (!user) {
-      return res.status(400).json({ message: "User not found" });
+    if (!user || !(await bcrypt.compare(password, user.password))) {
+      return res.status(400).json({ message: "Invalid email or password." });
     }
 
-    const isPasswordValid = await bcrypt.compare(password, user.password);
-    if (!isPasswordValid) {
-      return res.status(400).json({ message: "Invalid password" });
-    }
+    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: "1h" });
+    res.status(200).json({ token, isAdmin: user.isAdmin, message: "Sign-in successful." });
+  })
+);
 
-    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, {
-      expiresIn: "1h",
-    });
+app.get(
+  "/api/user",
+  authenticateToken,
+  asyncHandler(async (req, res) => {
+    const user = await User.findById(req.userId, "-password").lean();
+    if (!user) return res.status(404).json({ message: "User not found." });
 
-    res.status(200).json({ token, isAdmin: user.isAdmin, message: "Sign-in successful" });
-  } catch (error) {
-    res.status(500).json({ message: "Server error", error: error.message });
-  }
-});
-
-app.get("/api/user", authenticateToken, async (req, res) => {
-  try {
-    const user = await User.findById(req.userId, { password: 0 });
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
     res.status(200).json(user);
-  } catch (error) {
-    res.status(500).json({ message: "Server error", error: error.message });
-  }
-});
+  })
+);
 
-// Update User Profile
-app.put("/api/user", authenticateToken, async (req, res) => {
-  const { name, email } = req.body;
+app.put(
+  "/api/user",
+  authenticateToken,
+  asyncHandler(async (req, res) => {
+    const { name, email } = req.body;
 
-  try {
-    // Find the user and update their profile
     const user = await User.findById(req.userId);
     if (!user) {
-      return res.status(404).json({ message: "User not found" });
+      return res.status(404).json({ message: "User not found." });
     }
 
-    if (name) user.name = name;
     if (email) {
       const emailExists = await User.findOne({ email });
       if (emailExists && emailExists._id.toString() !== req.userId) {
-        return res.status(400).json({ message: "Email already in use" });
+        return res.status(400).json({ message: "Email already in use." });
       }
       user.email = email;
     }
+    user.name = name || user.name;
 
     await user.save();
-
-    res.status(200).json({ message: "Profile updated successfully", user });
-  } catch (error) {
-    res.status(500).json({ message: "Failed to update profile", error: error.message });
-  }
-});
+    res.status(200).json({ message: "Profile updated successfully." });
+  })
+);
 
 // Course Routes
-app.get("/api/courses", authenticateToken, async (req, res) => {
-  try {
-    const courses = await Course.find();
+app.get(
+  "/api/courses",
+  authenticateToken,
+  asyncHandler(async (_, res) => {
+    const courses = await Course.find().lean();
     res.status(200).json(courses);
-  } catch (error) {
-    res.status(500).json({ message: "Server error", error: error.message });
-  }
-});
+  })
+);
 
-app.post("/api/courses", authenticateToken, isAdmin, async (req, res) => {
-  const { title, lessons, image } = req.body;
+app.post(
+  "/api/courses",
+  authenticateToken,
+  isAdmin,
+  asyncHandler(async (req, res) => {
+    const { title, lessons, image } = req.body;
 
-  try {
-    if (!title || !lessons || !image) {
-      return res.status(400).json({ message: "All fields are required" });
-    }
+    const course = await Course.create({ title, lessons, image });
+    res.status(201).json(course);
+  })
+);
 
-    const newCourse = new Course({ title, lessons, image });
-    await newCourse.save();
-    res.status(201).json(newCourse);
-  } catch (error) {
-    console.error("Error adding course:", error);
-    res.status(500).json({ message: "Server error", error: error.message });
-  }
-});
+app.delete(
+  "/api/courses/:id",
+  authenticateToken,
+  isAdmin,
+  asyncHandler(async (req, res) => {
+    await Course.findByIdAndDelete(req.params.id);
+    res.status(200).json({ message: "Course deleted successfully." });
+  })
+);
 
-app.delete("/api/courses/:id", authenticateToken, isAdmin, async (req, res) => {
-  const { id } = req.params;
+app.get(
+  "/api/courses/search",
+  authenticateToken,
+  asyncHandler(async (req, res) => {
+    const { query } = req.query;
+    if (!query) return res.status(400).json({ message: "Search query required." });
 
-  try {
-    await Course.findByIdAndDelete(id);
-    res.status(200).json({ message: "Course deleted successfully" });
-  } catch (error) {
-    res.status(500).json({ message: "Server error", error: error.message });
-  }
-});
+    const courses = await Course.find({
+      title: { $regex: query, $options: "i" },
+    }).lean();
 
-app.get("/api/courses/search", authenticateToken, async (req, res) => {
-  const { query } = req.query;
-
-  try {
-    if (!query) {
-      return res.status(400).json({ message: "Search query is required" });
-    }
-
-    const courses = await Course.find({ title: { $regex: query, $options: "i" } });
     res.status(200).json(courses);
-  } catch (error) {
-    console.error("Error searching courses:", error);
-    res.status(500).json({ message: "Server error", error: error.message });
-  }
-});
+  })
+);
 
 // Topic Routes
-app.get("/api/courses/:courseId/topics", authenticateToken, async (req, res) => {
-  const { courseId } = req.params;
-
-  try {
-    const topics = await Topic.find({ courseId });
+app.get(
+  "/api/courses/:courseId/topics",
+  authenticateToken,
+  asyncHandler(async (req, res) => {
+    const topics = await Topic.find({ courseId: req.params.courseId }).lean();
     res.status(200).json(topics);
-  } catch (error) {
-    res.status(500).json({ message: "Server error", error: error.message });
-  }
-});
+  })
+);
 
-app.post("/api/courses/:courseId/topics", authenticateToken, isAdmin, async (req, res) => {
-  const { courseId } = req.params;
-  const { title, duration, youtubeLink } = req.body;
+app.post(
+  "/api/courses/:courseId/topics",
+  authenticateToken,
+  isAdmin,
+  asyncHandler(async (req, res) => {
+    const { courseId } = req.params;
+    const { title, duration, youtubeLink } = req.body;
 
-  try {
-    if (!title || !duration || !youtubeLink) {
-      return res.status(400).json({ message: "All fields are required" });
-    }
+    const topic = await Topic.create({ courseId, title, duration, youtubeLink });
+    res.status(201).json(topic);
+  })
+);
 
-    const newTopic = new Topic({ title, duration, youtubeLink, courseId });
-    await newTopic.save();
-    res.status(201).json(newTopic);
-  } catch (error) {
-    console.error("Error adding topic:", error);
-    res.status(500).json({ message: "Server error", error: error.message });
-  }
-});
+app.delete(
+  "/api/topics/:id",
+  authenticateToken,
+  isAdmin,
+  asyncHandler(async (req, res) => {
+    await Topic.findByIdAndDelete(req.params.id);
+    res.status(200).json({ message: "Topic deleted successfully." });
+  })
+);
 
-app.delete("/api/topics/:id", authenticateToken, isAdmin, async (req, res) => {
-  const { id } = req.params;
-
-  try {
-    await Topic.findByIdAndDelete(id);
-    res.status(200).json({ message: "Topic deleted successfully" });
-  } catch (error) {
-    res.status(500).json({ message: "Server error", error: error.message });
-  }
+// ---------- Error Handling Middleware ----------
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({ message: "An error occurred.", error: err.message });
 });
 
 // Start Server
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`Server is running on port ${PORT}`);
 });
