@@ -13,72 +13,90 @@ const PORT = process.env.PORT || 2004;
 
 // Middleware
 app.use(cors());
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: '10kb' })); // Limit body size to prevent DOS
 
-// MongoDB Connection
+// MongoDB Connection Optimization
 mongoose.connect(process.env.MONGO_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
+  maxPoolSize: 10, // Maintain up to 10 socket connections
+  serverSelectionTimeoutMS: 5000, // Keep trying to send operations for 5 seconds
+  socketTimeoutMS: 45000, // Close sockets after 45 seconds of inactivity
 })
 .then(() => console.log('MongoDB Connected'))
-.catch(err => console.log(err));
+.catch(err => {
+  console.error('MongoDB connection error:', err);
+  process.exit(1); // Exit process on connection failure
+});
 
-// User Schema
+// Schema Definitions with Indexes
 const userSchema = new mongoose.Schema({
   name: { type: String, required: true },
-  email: { type: String, required: true, unique: true },
-  password: { type: String, required: true },
+  email: { type: String, required: true, unique: true, index: true },
+  password: { type: String, required: true, select: false }, // Never return password in queries
   isAdmin: { type: Boolean, default: false },
-});
+}, { timestamps: true }); // Add createdAt and updatedAt
 
-const User = mongoose.model('User', userSchema);
-
-// Course Schema
 const courseSchema = new mongoose.Schema({
-  title: { type: String, required: true },
+  title: { type: String, required: true, index: true }, // Index for faster search
   lessons: { type: String, required: true },
   image: { type: String, required: true },
-});
+}, { timestamps: true });
 
-const Course = mongoose.model('Course', courseSchema);
-
-// Topic Schema
 const topicSchema = new mongoose.Schema({
   title: { type: String, required: true },
   duration: { type: String, required: true },
   youtubeLink: { type: String, required: true },
-  courseId: { type: mongoose.Schema.Types.ObjectId, ref: 'Course', required: true },
-});
+  courseId: { 
+    type: mongoose.Schema.Types.ObjectId, 
+    ref: 'Course', 
+    required: true,
+    index: true // Index for faster queries
+  },
+}, { timestamps: true });
 
+// Models
+const User = mongoose.model('User', userSchema);
+const Course = mongoose.model('Course', courseSchema);
 const Topic = mongoose.model('Topic', topicSchema);
 
-// Middleware to verify JWT token
+// Middleware Optimization
 const authenticateToken = (req, res, next) => {
-  const token = req.header('Authorization')?.split(' ')[1];
+  const authHeader = req.header('Authorization');
+  const token = authHeader?.split(' ')[1];
+  
   if (!token) {
     return res.status(401).json({ message: 'Access denied. No token provided.' });
   }
 
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+  // Verify token asynchronously to not block event loop
+  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+    if (err) {
+      return res.status(403).json({ message: 'Invalid or expired token' });
+    }
     req.userId = decoded.id;
     next();
-  } catch (error) {
-    res.status(400).json({ message: 'Invalid token' });
-  }
+  });
 };
 
-// Middleware to check if the user is an admin
 const isAdmin = async (req, res, next) => {
   try {
-    const user = await User.findById(req.userId);
-    if (!user || !user.isAdmin) {
-      return res.status(403).json({ message: 'Access denied. Admin privileges required.' });
+    // Only select isAdmin field for efficiency
+    const user = await User.findById(req.userId).select('isAdmin');
+    if (!user?.isAdmin) {
+      return res.status(403).json({ message: 'Admin privileges required.' });
     }
     next();
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
   }
+};
+
+// Response Handler Utility
+const handleResponse = (res, status, message, data = null) => {
+  const response = { message };
+  if (data) response.data = data;
+  return res.status(status).json(response);
 };
 
 // API Routes
@@ -88,18 +106,28 @@ app.post('/api/signup', async (req, res) => {
   const { name, email, password } = req.body;
 
   try {
-    const existingUser = await User.findOne({ email });
+    // Input validation
+    if (!name || !email || !password) {
+      return handleResponse(res, 400, 'All fields are required');
+    }
+
+    // Check existing user using lean() for faster query
+    const existingUser = await User.findOne({ email }).lean();
     if (existingUser) {
-      return res.status(400).json({ message: 'User already exists' });
+      return handleResponse(res, 400, 'User already exists');
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
-    const newUser = new User({ name, email, password: hashedPassword });
-    await newUser.save();
-
-    res.status(201).json({ message: 'User created successfully' });
+    const newUser = await User.create({ name, email, password: hashedPassword });
+    
+    handleResponse(res, 201, 'User created successfully', {
+      id: newUser._id,
+      name: newUser.name,
+      email: newUser.email
+    });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    console.error('Signup error:', error);
+    handleResponse(res, 500, 'Server error');
   }
 });
 
@@ -107,45 +135,87 @@ app.post('/api/signin', async (req, res) => {
   const { email, password } = req.body;
 
   try {
-    const user = await User.findOne({ email });
+    if (!email || !password) {
+      return handleResponse(res, 400, 'Email and password are required');
+    }
+
+    // Select only necessary fields (+password for comparison)
+    const user = await User.findOne({ email }).select('+password isAdmin');
     if (!user) {
-      return res.status(400).json({ message: 'User not found' });
+      return handleResponse(res, 400, 'Invalid credentials');
     }
 
     const isPasswordValid = await bcrypt.compare(password, user.password);
     if (!isPasswordValid) {
-      return res.status(400).json({ message: 'Invalid password' });
+      return handleResponse(res, 400, 'Invalid credentials');
     }
 
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, {
       expiresIn: '1h',
     });
 
-    res.status(200).json({ token, isAdmin: user.isAdmin, message: 'Sign-in successful' });
+    handleResponse(res, 200, 'Sign-in successful', {
+      token,
+      isAdmin: user.isAdmin,
+      name: user.name,
+      email: user.email
+    });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    console.error('Signin error:', error);
+    handleResponse(res, 500, 'Server error');
   }
 });
 
 app.get('/api/user', authenticateToken, async (req, res) => {
   try {
-    const user = await User.findById(req.userId, { password: 0 });
+    // Exclude password and other sensitive fields
+    const user = await User.findById(req.userId)
+      .select('-password -__v');
+    
     if (!user) {
-      return res.status(404).json({ message: 'User not found' });
+      return handleResponse(res, 404, 'User not found');
     }
-    res.status(200).json(user);
+    handleResponse(res, 200, 'User retrieved', user);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    console.error('Get user error:', error);
+    handleResponse(res, 500, 'Server error');
+  }
+});
+
+app.put('/api/user', authenticateToken, async (req, res) => {
+  try {
+    const { name, email } = req.body;
+
+    if (!name || !email) {
+      return handleResponse(res, 400, 'Name and email are required');
+    }
+
+    const updatedUser = await User.findByIdAndUpdate(
+      req.userId,
+      { name, email },
+      { new: true, select: '-password -__v' } // Return updated doc without sensitive fields
+    );
+
+    if (!updatedUser) {
+      return handleResponse(res, 404, 'User not found');
+    }
+
+    handleResponse(res, 200, 'Profile updated successfully', updatedUser);
+  } catch (error) {
+    console.error('Update user error:', error);
+    handleResponse(res, 500, 'Failed to update profile');
   }
 });
 
 // Course Routes
 app.get('/api/courses', authenticateToken, async (req, res) => {
   try {
-    const courses = await Course.find();
-    res.status(200).json(courses);
+    // Use lean() for faster read-only operations
+    const courses = await Course.find().lean();
+    handleResponse(res, 200, 'Courses retrieved', courses);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    console.error('Get courses error:', error);
+    handleResponse(res, 500, 'Server error');
   }
 });
 
@@ -154,26 +224,27 @@ app.post('/api/courses', authenticateToken, isAdmin, async (req, res) => {
 
   try {
     if (!title || !lessons || !image) {
-      return res.status(400).json({ message: 'All fields are required' });
+      return handleResponse(res, 400, 'All fields are required');
     }
 
-    const newCourse = new Course({ title, lessons, image });
-    await newCourse.save();
-    res.status(201).json(newCourse);
+    const newCourse = await Course.create({ title, lessons, image });
+    handleResponse(res, 201, 'Course created', newCourse);
   } catch (error) {
-    console.error('Error adding course:', error);
-    res.status(500).json({ message: 'Server error', error: error.message });
+    console.error('Add course error:', error);
+    handleResponse(res, 500, 'Server error');
   }
 });
 
 app.delete('/api/courses/:id', authenticateToken, isAdmin, async (req, res) => {
-  const { id } = req.params;
-
   try {
-    await Course.findByIdAndDelete(id);
-    res.status(200).json({ message: 'Course deleted successfully' });
+    const deletedCourse = await Course.findByIdAndDelete(req.params.id);
+    if (!deletedCourse) {
+      return handleResponse(res, 404, 'Course not found');
+    }
+    handleResponse(res, 200, 'Course deleted');
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    console.error('Delete course error:', error);
+    handleResponse(res, 500, 'Server error');
   }
 });
 
@@ -181,92 +252,87 @@ app.get('/api/courses/search', authenticateToken, async (req, res) => {
   const { query } = req.query;
 
   try {
-    if (!query) {
-      return res.status(400).json({ message: 'Search query is required' });
+    if (!query || query.length < 3) {
+      return handleResponse(res, 400, 'Search query must be at least 3 characters');
     }
 
-    const courses = await Course.find({ title: { $regex: query, $options: 'i' } });
-    res.status(200).json(courses);
+    // Text search with index
+    const courses = await Course.find({
+      $text: { $search: query }
+    }).lean();
+
+    handleResponse(res, 200, 'Search results', courses);
   } catch (error) {
-    console.error('Error searching courses:', error);
-    res.status(500).json({ message: 'Server error', error: error.message });
+    console.error('Search error:', error);
+    handleResponse(res, 500, 'Server error');
   }
 });
 
 // Topic Routes
 app.get('/api/courses/:courseId/topics', authenticateToken, async (req, res) => {
-  const { courseId } = req.params;
-
   try {
-    const topics = await Topic.find({ courseId });
-    res.status(200).json(topics);
+    const topics = await Topic.find({ courseId: req.params.courseId }).lean();
+    handleResponse(res, 200, 'Topics retrieved', topics);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    console.error('Get topics error:', error);
+    handleResponse(res, 500, 'Server error');
   }
 });
 
 app.post('/api/courses/:courseId/topics', authenticateToken, isAdmin, async (req, res) => {
-  const { courseId } = req.params;
   const { title, duration, youtubeLink } = req.body;
 
   try {
     if (!title || !duration || !youtubeLink) {
-      return res.status(400).json({ message: 'All fields are required' });
+      return handleResponse(res, 400, 'All fields are required');
     }
 
-    const newTopic = new Topic({ title, duration, youtubeLink, courseId });
-    await newTopic.save();
-    res.status(201).json(newTopic);
+    const newTopic = await Topic.create({
+      title,
+      duration,
+      youtubeLink,
+      courseId: req.params.courseId
+    });
+
+    handleResponse(res, 201, 'Topic created', newTopic);
   } catch (error) {
-    console.error('Error adding topic:', error);
-    res.status(500).json({ message: 'Server error', error: error.message });
+    console.error('Add topic error:', error);
+    handleResponse(res, 500, 'Server error');
   }
 });
 
 app.delete('/api/topics/:id', authenticateToken, isAdmin, async (req, res) => {
-  const { id } = req.params;
-
   try {
-    await Topic.findByIdAndDelete(id);
-    res.status(200).json({ message: 'Topic deleted successfully' });
+    const deletedTopic = await Topic.findByIdAndDelete(req.params.id);
+    if (!deletedTopic) {
+      return handleResponse(res, 404, 'Topic not found');
+    }
+    handleResponse(res, 200, 'Topic deleted');
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    console.error('Delete topic error:', error);
+    handleResponse(res, 500, 'Server error');
   }
 });
 
-app.put('/api/user', authenticateToken, async (req, res) => {
-  try {
-    console.log('Request Body:', req.body); // Debugging
-    const { name, email } = req.body;
-
-    // Validate request body
-    if (!name || !email) {
-      return res.status(400).json({ message: 'Name and email are required' });
-    }
-
-    const userId = req.userId; // Get user ID from the token
-    console.log('User ID:', userId); // Debugging
-
-    // Update the user's name and email
-    const updatedUser = await User.findByIdAndUpdate(
-      userId,
-      { name, email },
-      { new: true }
-    );
-
-    if (!updatedUser) {
-      return res.status(404).json({ message: 'User not found' });
-    }
-
-    console.log('Updated User:', updatedUser); // Debugging
-    res.status(200).json({ message: 'Profile updated successfully' });
-  } catch (error) {
-    console.error('Error updating profile:', error); // Debugging
-    res.status(500).json({ message: 'Failed to update profile' });
-  }
+// Error Handling Middleware
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  handleResponse(res, 500, 'Internal server error');
 });
 
 // Start Server
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+});
+
+// Handle graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received. Shutting down gracefully');
+  server.close(() => {
+    console.log('Server closed');
+    mongoose.connection.close(false, () => {
+      console.log('MongoDB connection closed');
+      process.exit(0);
+    });
+  });
 });
